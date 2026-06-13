@@ -219,6 +219,80 @@ run_sync(agent, event)
     └── 更新 Agent 缓存
 ```
 
+## 九B、访问控制与安全策略
+
+源码：`gateway/run.py`（`_adapter_dm_policy` / `_check_access`）、`gateway/pairing.py`
+
+### 9B.1 三层访问策略
+
+Gateway 对每个传入消息执行三层访问控制：
+
+| 层 | 配置项 | 说明 |
+|---|---|---|
+| **DM 策略** | `dm_policy` | `open`（接受所有私聊）/ `allowlist`（仅白名单用户）/ `deny`（拒绝所有私聊） |
+| **群聊策略** | `group_policy` | `open` / `allowlist` / `deny`（同上，针对群聊） |
+| **来源白名单** | `allow_from` | 按 `platform:user_id` 精确匹配的白名单 |
+
+**重要**：飞书的 `group_policy` 通过环境变量 `FEISHU_GROUP_POLICY` 读取（而非 config.yaml 中的字段），默认 `allowlist` 会静默丢弃群消息。
+
+### 9B.2 配置方式
+
+```yaml
+# config.yaml — 全局默认
+gateway:
+  dm_policy: allowlist
+  group_policy: open
+
+# 环境变量 — 平台级覆盖
+TELEGRAM_ALLOWED_USERS=123456,789012    # Telegram 白名单
+DISCORD_ALLOWED_CHANNELS=111,222        # Discord 白名单
+FEISHU_GROUP_POLICY=open                 # 飞书群聊策略
+```
+
+无白名单且非 `open` 时，Gateway 启动日志会输出警告。
+
+### 9B.3 DM Pairing（代码配对）
+
+源码：`gateway/pairing.py:PairingStore`
+
+对于没有稳定用户 ID 的平台，Gateway 支持代码配对认证：
+
+```
+用户发送 /start → Gateway 生成 6 位配对码
+    ↓
+用户在 CLI 执行 hermes pair <code>
+    ↓
+PairingStore 记录 (platform, user_id) → user_authorized
+```
+
+### 9B.4 速率限制
+
+```python
+# PairingStore 内置速率限制
+if self.pairing_store._is_rate_limited(platform_name, source.user_id):
+    # 拒绝请求，不创建 Agent
+    return
+    
+self.pairing_store._record_rate_limit(platform_name, source.user_id)
+```
+
+Agent 层面也有 `RateLimitTracker`（`agent/rate_limit_tracker.py`），跟踪每个 Provider 的 rate limit 状态（剩余请求数、重置时间），在 `/usage` 命令中展示。
+
+### 9B.5 启动安全检查
+
+```python
+# Gateway 启动时检查
+_any_allowlist = any([
+    TELEGRAM_ALLOWED_USERS, DISCORD_ALLOWED_CHANNELS,
+    FEISHU_ALLOWED_USERS, ...
+])
+if not _any_allowlist and not _allow_all:
+    logger.warning(
+        "No user allowlists configured. All unauthorized users will be denied. "
+        "Set allow_all=true or configure platform allowlists."
+    )
+```
+
 ## 十、关键设计决策
 
 | 设计决策 | 原因 |
@@ -231,6 +305,10 @@ run_sync(agent, event)
 | 线程池执行 Agent | 不阻塞事件循环 |
 | PII 哈希存储 | 日志中的 chat_id/sender_id 脱敏 |
 | 60 秒 Cron tick | 在 Gateway 进程内运行，无需额外进程 |
+| 三层访问控制 | dm_policy + group_policy + allow_from 防止未授权访问 |
+| 环境变量覆盖 config | 平台级配置优先于全局默认，运维友好 |
+| 启动安全检查 | 无白名单时警告，防止意外开放访问 |
+| DM Pairing 速率限制 | 防止配对码暴力枚举 |
 
 ## 十一、学习检查点
 
@@ -240,3 +318,5 @@ run_sync(agent, event)
 - [ ] 理解消息历史重放中的特殊字段处理？
 - [ ] 能否列举支持的平台和 Adapter 接口？
 - [ ] 理解 StreamingContextScrubber 在流式输出中的作用？
+- [ ] 能解释三层访问控制（dm_policy / group_policy / allow_from）的配置方式？
+- [ ] 理解飞书 group_policy 必须通过环境变量配置的原因？

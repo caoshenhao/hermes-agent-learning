@@ -268,6 +268,35 @@ def _content_length_for_budget(content):
     """文本 → len(text)，图片 → 固定 _IMAGE_CHAR_EQUIVALENT"""
 ```
 
+## 十B、焦点压缩（Focus Compression）
+
+源码：`agent/context_compressor.py:compress(focus_topic=...)`
+
+用户可以通过 `/compress <topic>` 指定焦点主题，引导压缩器优先保留相关信息：
+
+```python
+def compress(self, messages, focus_topic=None):
+    """当 focus_topic 非空时，注入焦点指导到摘要提示词"""
+    if focus_topic:
+        guidance = f'''FOCUS TOPIC: "{focus_topic}"
+The user has requested that this compaction PRIORITISE preserving all 
+information related to the focus topic above. For content related to 
+"{focus_topic}", include full detail — exact values, file paths, command 
+outputs, error messages, and decisions. For content NOT related to the 
+focus topic, summarise more aggressively. The focus topic sections should 
+receive roughly 60-70% of the summary token budget. Even for the focus 
+topic, NEVER preserve API keys, tokens, passwords, or credentials.'''
+```
+
+### 焦点压缩 vs 全量压缩
+
+| 维度 | 全量压缩 | 焦点压缩 |
+|---|---|---|
+| 触发方式 | 自动（80% 阈值）或 `/compress` | `/compress <topic>` |
+| Token 预算分配 | 均匀分配 | 焦点主题占 60-70% |
+| 非焦点内容 | 正常摘要 | 更激进摘要或省略 |
+| 适用场景 | 一般超长对话 | 需要保留特定主题细节 |
+
 ## 十一、关键设计决策
 
 | 设计决策 | 原因 |
@@ -282,6 +311,8 @@ def _content_length_for_budget(content):
 | 降级处理 | LLM 失败时仍可保持对话连续性 |
 | 迭代摘要（V1→V2→V3） | 多次压缩不丢失信息 |
 | 辅助模型（非主模型） | 降低成本 |
+| 焦点压缩（`/compress <topic>`） | 用户引导保留特定主题，60-70% 预算倾斜 |
+| Smart Defer（延迟压缩） | 粗略高估时避免过早压缩，允许 5% 增长空间 |
 
 ## 十二、数据流全景
 

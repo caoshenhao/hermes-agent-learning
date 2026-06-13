@@ -156,10 +156,43 @@ cache_key = (
 
 Skills 在注入提示词前经过多层过滤：
 
-1. **平台过滤**：`skill_matches_platform()` — 检查 `platforms` frontmatter
-2. **环境过滤**：`skill_matches_environment()` — 检查运行环境（Docker/Kanban/S6）
-3. **禁用过滤**：检查 `skills.disabled` 配置
-4. **工具依赖过滤**：`_skill_should_show()` — 检查 Skill 需要的工具是否可用
+1. **平台过滤**：`skill_matches_platform()` — 检查 `platforms` frontmatter。无 `platforms` 字段 = 全平台兼容。Termux 特殊处理：`linux` 标签的 Skill 在 Termux 上视为兼容
+2. **环境过滤**：`skill_matches_environment()` — 检查运行环境（Docker/Kanban/S6）。**注意：这是 offer-time 相关性门控，不是硬兼容门控**——显式加载不受此限制
+3. **禁用过滤**：检查 `skills.disabled` 配置列表
+4. **条件激活过滤**：`_skill_should_show()` — 检查 Skill 的 `requires` / `fallback_for` 条件规则（详见 §五B）
+
+### 5.4 外部 Skill 目录
+
+`skills.external_dirs` 配置项允许挂载只读的外部 Skill 目录：
+
+- 外部目录中的 Skill 与本地 `~/.hermes/skills/` 一起扫描
+- **本地 Skill 优先**：同名冲突时本地版本覆盖外部版本
+- 外部目录**不做磁盘快照**（只读且通常较小），每次直接扫描
+- 新建 Skill 始终写入本地目录
+
+## 五B、条件激活规则（Conditional Activation）
+
+源码：`agent/skill_utils.py:extract_skill_conditions()` + `agent/prompt_builder.py:_skill_should_show()`
+
+Skill 可通过 frontmatter 的 `metadata.hermes` 声明条件激活规则，控制何时在系统提示词中出现：
+
+```yaml
+metadata:
+  hermes:
+    requires_toolsets: ["browser"]        # 需要 browser 工具集才显示
+    requires_tools: ["terminal"]           # 需要 terminal 工具才显示
+    fallback_for_toolsets: ["web"]         # 仅当 web 工具集不可用时显示（降级方案）
+    fallback_for_tools: ["web_search"]     # 仅当 web_search 工具不可用时显示
+```
+
+| 规则类型 | 语义 |
+|---|---|
+| `requires_toolsets` | **需要**指定工具集**可用**才显示该 Skill |
+| `requires_tools` | **需要**指定工具**可用**才显示该 Skill |
+| `fallback_for_toolsets` | 仅当指定工具集**不可用**时显示（降级替代方案） |
+| `fallback_for_tools` | 仅当指定工具**不可用**时显示 |
+
+当 `available_tools` 和 `available_toolsets` 均为 `None` 时，条件检查被跳过（所有 Skill 显示——向后兼容）。
 
 ## 六、skill_manage 工具
 
@@ -313,6 +346,9 @@ curator.py → 后台审查 → 维护 Skill 健康
 | 只归档不删除 | Curator 的安全底线 — 归档可恢复 |
 | 路径遍历检测 | 防止 `../` 等攻击读取任意文件 |
 | absorbed_into 语义 | 帮助 Curator 区分合并与清理 |
+| 条件激活规则 | 降级 Skill 仅在主工具不可用时出现，避免干扰 |
+| 本地优先 + 外部只读 | 支持多源 Skill 挂载而不破坏本地写权限 |
+| 环境过滤是 offer-time 门控 | 显式加载可绕过——避免在受限环境中无法手动调用 |
 
 ## 十二、学习检查点
 
@@ -321,3 +357,5 @@ curator.py → 后台审查 → 维护 Skill 健康
 - [ ] 理解 Curator 的触发条件和安全约束？
 - [ ] 能否自己创建一个完整的 Skill（含 frontmatter + 辅助文件）？
 - [ ] 理解两层缓存的设计？（LRU + 磁盘快照）
+- [ ] 能解释条件激活的四种规则（requires / fallback_for × tools / toolsets）？
+- [ ] 理解外部 Skill 目录的本地优先策略？

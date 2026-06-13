@@ -275,6 +275,58 @@ def get_model_context_length(model, provider=None):
 # - Kimi Coding
 ```
 
+## 八B、Reasoning / Thinking 模式
+
+源码：`run_agent.py`（`_is_thinking_only_assistant` / `_drop_thinking_only_and_merge_users`）
+
+### 8B.1 Reasoning Effort
+
+Hermes 支持通过 `reasoning_effort` 参数控制模型的推理深度：
+
+| 值 | 行为 |
+|---|---|
+| `"low"` / `"minimal"` | 快速回答，最少推理 |
+| `"medium"` | 标准推理（默认） |
+| `"high"` / `"heavy"` | 深度推理，更长思考链 |
+
+**Provider 适配**：
+- **GitHub Models**：通过 `github_model_reasoning_efforts()` 查询支持的 effort 级别，不支持的级别会被 clamp 到最接近的有效值
+- **LM Studio**：`_resolve_lmstudio_summary_reasoning_effort()` 选择安全的 top-level effort
+- **Anthropic**：转换为 `budget_tokens` 参数（extended thinking）
+- **DeepSeek/Kimi**：自动映射到 `enable_thinking` + `thinking_budget`
+
+### 8B.2 Thinking-Only 消息处理
+
+某些 Provider 网关将 reasoning 转换为 `thinking` content blocks，导致 assistant 消息**只有 thinking blocks 而没有实际文本内容**。这类消息会导致 Chat Completions API 报错（`finish_reason` 不能是 `thinking`）。
+
+```python
+def _is_thinking_only_assistant(msg):
+    """检测消息是否只包含 thinking blocks。
+    
+    返回 True 时该消息需要被特殊处理：
+    - 如果有后续 user 消息 → 合并
+    - 如果没有 → 附加占位符文本
+    """
+    blocks = msg.get("content", [])
+    has_text = any(
+        b.get("type") == "text" and b.get("text", "").strip()
+        for b in blocks
+    )
+    has_thinking = any(
+        b.get("type") in {"thinking", "redacted_thinking"}
+        for b in blocks
+    )
+    return has_thinking and not has_text
+```
+
+### 8B.3 Thinking Callback
+
+`run_agent.py` 支持 `thinking_callback`，在流式输出中将 thinking/reasoning 块实时回传给 UI（如 TUI 的思考面板）。这使用户能够看到模型的推理过程，而不仅仅是最终回答。
+
+### 8B.4 Scrubber 抑制
+
+通过 `StreamingThinkScrubber`（模块2 §十一），thinking 块在发给用户前可以被过滤——某些平台（如 SMS、Telegram）不适合显示长推理链。
+
 ## 九、Per-Task 配置
 
 ```yaml

@@ -311,21 +311,139 @@ agent._execution_thread_id = threading.current_thread().ident
 _ra()._set_interrupt(False, agent._execution_thread_id)
 ```
 
-## 八、系统提示词缓存
+## 八、系统提示词三层架构
 
-系统提示词是 Hermes 省 Token 的关键设计之一：
+系统提示词是 Hermes 省 Token 的核心设计。`agent/system_prompt.py` 将系统提示词分为**三个有序层级**，按缓存友好性排序：
 
-```python
-# 构建一次，缓存整个会话
-if agent._cached_system_prompt is None:
-    _restore_or_build_system_prompt(agent, system_message, conversation_history)
+### 8.1 三层结构
 
-active_system_prompt = agent._cached_system_prompt
+```
+┌─────────────────────────────────────────────────┐
+│  Layer 1: stable（稳定层）                        │
+│  整个进程生命周期不变 → prefix cache 命中率最高      │
+│  ├── SOUL.md 身份（或 DEFAULT_AGENT_IDENTITY）     │
+│  ├── Hermes Agent 帮助指引                         │
+│  ├── 任务完成/反编造指引（TASK_COMPLETION_GUIDANCE） │
+│  ├── 工具行为指引（memory/session_search/skills）     │
+│  ├── 工具使用强制规则（TOOL_USE_ENFORCEMENT）         │
+│  ├── 模型特定指引（Google/OpenAI/xAI 运营规范）       │
+│  ├── Skills 系统提示词                              │
+│  ├── 环境探测（Python 版本、PEP 668、uv 等）          │
+│  ├── 当前 Profile 提示                             │
+│  └── 平台提示（PLATFORM_HINTS）                     │
+├─────────────────────────────────────────────────┤
+│  Layer 2: context（上下文层）                      │
+│  会话内稳定，不同工作目录会变化                        │
+│  ├── 调用方传入的 system_message                   │
+│  └── 上下文文件（AGENTS.md / .cursorrules /         │
+│      CLAUDE.md / SOUL.md）                         │
+├─────────────────────────────────────────────────┤
+│  Layer 3: volatile（易变层）                       │
+│  每次构建可能变化 → 不参与 prefix cache              │
+│  ├── 内置记忆快照（MEMORY.md 内容）                  │
+│  ├── 用户画像（USER.md 内容）                       │
+│  ├── 外部记忆 Provider 块（honcho/mem0 等）          │
+│  └── 时间戳行（仅日期精度，非分钟精度）               │
+└─────────────────────────────────────────────────┘
 ```
 
-- **只在首次调用时构建**，后续复用
-- **上下文压缩后重建**（因为消息历史变了）
-- **网关场景**：从 SessionDB 恢复（而非重建），保持 Anthropic prefix cache 命中
+### 8.2 构建流程
+
+```python
+# agent/system_prompt.py
+def build_system_prompt_parts(agent, system_message=None) -> dict:
+    """返回 {"stable": ..., "context": ..., "volatile": ...}"""
+    stable_parts = [...]   # 身份 + 指引 + 环境
+    context_parts = [...]  # system_message + 上下文文件
+    volatile_parts = [...] # 记忆 + 用户画像 + 时间戳
+    return {
+        "stable":   "\n\n".join(...),
+        "context":  "\n\n".join(...),
+        "volatile": "\n\n".join(...),
+    }
+
+def build_system_prompt(agent, system_message=None) -> str:
+    parts = build_system_prompt_parts(agent, system_message)
+    return "\n\n".join(p for p in (parts["stable"], parts["context"], parts["volatile"]) if p)
+```
+
+### 8.3 缓存与恢复策略
+
+`_restore_or_build_system_prompt()`（conversation_loop.py L218）实现了**四状态恢复**：
+
+| 存储状态 | 含义 | 处理 |
+|---|---|---|
+| `missing` | 无会话行（首次对话） | 正常路径，从头构建 |
+| `null` | 会话行存在但 `system_prompt` 列为 NULL | 警告（遗留会话），从头构建 |
+| `empty` | 存储了空字符串 | 警告（持久化 bug），从头构建 |
+| `present` | 有可用提示词 | **直接复用**，保证 prefix cache 命中 |
+
+**关键原则**：系统提示词在整个会话期间**绝不部分重建**。只有上下文压缩时才会完整重建。
+
+### 8.4 时间戳的缓存友好设计
+
+```python
+# volatile 层的时间戳仅使用日期精度（非分钟精度）
+timestamp_line = f"Conversation started: {now.strftime('%A, %B %d, %Y')}"
+# 不用 %H:%M — 分钟精度会在每次重建时改变，导致 prefix cache 失效
+```
+
+### 8.5 插件上下文为什么不放进系统提示词
+
+插件钩子 `pre_llm_call` 的输出注入到**用户消息尾部**，而非系统提示词。这是因为系统提示词必须保持字节级稳定才能命中 prefix cache，而插件输出每次可能不同。
+
+## 八B、Anthropic Prompt Caching
+
+`agent/prompt_caching.py` 实现了 Anthropic 原生 prompt caching 策略：
+
+### 策略：`system_and_3`
+
+在消息列表中放置**最多 4 个 `cache_control` 断点**：
+
+```
+消息列表:
+  [0] system prompt  ← cache_control: ephemeral  (断点 1)
+  [1] user msg       ← (历史消息，无断点)
+  [2] assistant msg  ← (历史消息，无断点)
+  ...
+  [N-2] user msg     ← cache_control: ephemeral  (断点 2)
+  [N-1] assistant    ← cache_control: ephemeral  (断点 3)
+  [N] tool result    ← cache_control: ephemeral  (断点 4)
+```
+
+```python
+# agent/prompt_caching.py L49
+def apply_anthropic_cache_control(api_messages, cache_ttl="5m", native_anthropic=False):
+    """在 system prompt + 最后 3 条非 system 消息上注入 cache_control"""
+    messages = copy.deepcopy(api_messages)
+    marker = {"type": "ephemeral"}  # 或 {"type": "ephemeral", "ttl": "1h"}
+
+    # 断点 1: system prompt
+    if messages[0].get("role") == "system":
+        _apply_cache_marker(messages[0], marker)
+        breakpoints_used = 1
+
+    # 断点 2-4: 最后 3 条非 system 消息
+    remaining = 4 - breakpoints_used
+    non_sys = [i for i in range(len(messages)) if messages[i]["role"] != "system"]
+    for idx in non_sys[-remaining:]:
+        _apply_cache_marker(messages[idx], marker)
+
+    return messages
+```
+
+### 触发条件
+
+```python
+# conversation_loop.py L1058
+if agent._use_prompt_caching:  # 自动检测 Anthropic 模型
+    api_messages = apply_anthropic_cache_control(api_messages, cache_ttl="5m")
+```
+
+### 效果
+
+- 多轮对话中 input token 成本降低约 **75%**
+- 需要与系统提示词缓存配合：系统提示词不变 + cache_control 断点 = 连续命中
 
 ## 九、Preflight 上下文压缩
 
@@ -357,47 +475,267 @@ if compression_enabled and len(messages) > threshold:
 | 7. Anthropic 缓存 | 注入 cache_control 断点 |
 | 8. 清理孤立结果 | 移除没有对应 tool_call 的 tool result |
 
-## 十一、流式 vs 非流式
+## 十一、流式响应处理与 Scrubber
+
+### 11.1 流式 vs 非流式
 
 | 模式 | 触发条件 | 特点 |
 |---|---|---|
 | 非流式 | 默认（CLI 模式） | 等待完整响应 |
 | 流式 | `stream_callback` 不为空 | 逐 token 回调，TTS 管线可用 |
 
-## 十二、模型响应处理
+### 11.2 StreamingThinkScrubber（流式推理过滤）
 
-### 有 tool_calls
+`agent/think_scrubber.py` 是一个**有状态流式过滤器**，解决跨 delta 的 reasoning 标签泄露问题。
 
-```
-响应包含 tool_calls
-    → 并行/串行执行工具
-    → 将结果追加到 messages
-    → 继续循环
-```
-
-### 纯文本响应
+**问题场景**：MiniMax-M2.7 等模型将 `<think>` 标签和内容分成不同 delta 发送：
 
 ```
-响应不包含 tool_calls
-    → 作为 final_response
-    → 退出循环
+delta1 = "<think>"           → 旧的 per-delta 正则直接删除
+delta2 = "Let me check..."    → 下游看不到开标签，当作正文 → 推理泄露给用户！
+delta3 = "</think>"
 ```
 
-### 空响应
+**解决方案**：`StreamingThinkScrubber` 在上游统一过滤，所有 `stream_delta_callback` 收到的文本已经过清理。
+
+```python
+# agent/think_scrubber.py
+class StreamingThinkScrubber:
+    _OPEN_TAG_NAMES = ("think", "thinking", "reasoning", "thought", "REASONING_SCRATCHPAD")
+
+    def __init__(self):
+        self._in_block = False         # 是否在 reasoning 块内
+        self._buf = ""                 # 缓存的可能是部分标签的尾部
+        self._last_emitted_ended_newline = True  # 上一次输出是否以换行结尾
+
+    def feed(self, text: str) -> str:
+        """输入一个 delta，返回已过滤的可见部分（可能为空）"""
+        buf = self._buf + text
+        # 状态机：在 block 内 → 找关闭标签；在 block 外 → 找开标签
+        # 部分标签（如 "<thin"）被缓存到 _buf，等下一个 delta 解决
+
+    def flush(self) -> str:
+        """流结束时调用，释放缓存的内容"""
+
+    def reset(self):
+        """每轮对话开始时重置，防止上一轮的残留状态污染"""
+```
+
+### 11.3 _fire_stream_delta 管线
+
+```python
+# run_agent.py L4022
+def _fire_stream_delta(self, text: str) -> None:
+    # 1. 如果上一轮是工具调用，在首次文本前插入段落分隔
+    if self._stream_needs_break and text and text.strip():
+        text = "\n\n" + text
+
+    # 2. ★ StreamingThinkScrubber：过滤 reasoning/thinking 块
+    think_scrubber = self._stream_think_scrubber
+    if think_scrubber is not None:
+        text = think_scrubber.feed(text)    # 有状态过滤
+
+    # 3. ★ Context Scrubber：过滤记忆上下文泄露
+    scrubber = self._stream_context_scrubber
+    if scrubber is not None:
+        text = scrubber.feed(text)          # 防止 MEMORY 上下文泄露到 UI
+
+    # 4. 分发给所有回调（CLI 显示 + TTS）
+    for cb in (self.stream_delta_callback, self._stream_callback):
+        if cb:
+            cb(text)
+```
+
+### 11.4 双 Scrubber 重置
+
+每轮对话开始时，两个 scrubber 都被重置：
+
+```python
+# conversation_loop.py L550-560
+scrubber = agent._stream_context_scrubber
+if scrubber is not None:
+    scrubber.reset()          # 清除记忆上下文过滤状态
+
+think_scrubber = agent._stream_think_scrubber
+if think_scrubber is not None:
+    think_scrubber.reset()    # 清除 reasoning 过滤状态
+```
+
+### 11.5 完整响应的 Think Block 清理
+
+对于非流式完整响应（或流式结束后的 fallback），使用基于正则的 `_strip_think_blocks()`：
+
+```python
+# conversation_loop.py 中多处调用
+final_response = agent._strip_think_blocks(final_response).strip()
+```
+
+## 十二、模型响应处理与工具执行管线
+
+### 12.1 响应分支
+
+```
+模型返回响应
+    │
+    ├── 有 tool_calls → ★ 工具执行管线（见 12.2）→ 回到循环
+    ├── 纯文本 → 作为 final_response → 退出循环
+    ├── 空响应 → 重试（最多 _empty_content_retries 次）
+    └── finish_reason="length" → length continuation（追加 continuation prompt）
+```
+
+### 12.2 工具执行管线（完整 6 步）
+
+当模型返回 `tool_calls` 时，经过以下严格管线：
+
+**Step 1: 工具名验证与修复**
+
+```python
+# conversation_loop.py L3870-3921
+for tc in assistant_message.tool_calls:
+    if tc.function.name not in agent.valid_tool_names:
+        repaired = agent._repair_tool_call(tc.function.name)  # 模糊匹配修复
+        if repaired:
+            tc.function.name = repaired
+
+# 仍有无效工具名 → 返回错误给模型自我纠正（最多 3 次）
+invalid_tool_calls = [tc.function.name for tc in ... if tc.function.name not in valid_tool_names]
+if invalid_tool_calls:
+    agent._invalid_tool_retries += 1
+    if agent._invalid_tool_retries >= 3:
+        return {"partial": True, "error": "invalid tool call"}
+    # 返回工具错误消息，让模型下一轮纠正
+```
+
+**Step 2: JSON 参数验证**
+
+```python
+# conversation_loop.py L3923-4011
+for tc in assistant_message.tool_calls:
+    args = tc.function.arguments
+    if not args or not args.strip():
+        tc.function.arguments = "{}"     # 空参数 → 空对象
+        continue
+    try:
+        json.loads(args)
+    except json.JSONDecodeError as e:
+        # 检查是否为截断（args 不以 } 或 ] 结尾）
+        if truncated:
+            return {"partial": True, "error": "truncated"}
+        # 重试（最多 3 次），超过则注入恢复性 tool result
+```
+
+**Step 3: 后置护栏**
+
+```python
+# conversation_loop.py L4016-4022
+# 限制 delegate_task 并发数
+assistant_message.tool_calls = agent._cap_delegate_task_calls(tool_calls)
+# 去重（相同工具+相同参数的重复调用）
+assistant_message.tool_calls = agent._deduplicate_tool_calls(tool_calls)
+```
+
+**Step 4: 分发到执行器**
+
+```python
+# run_agent.py L4950-4971
+def _execute_tool_calls(self, assistant_message, messages, task_id, api_call_count):
+    if not _should_parallelize_tool_batch(tool_calls):
+        return self._execute_tool_calls_sequential(...)    # 串行路径
+    return self._execute_tool_calls_concurrent(...)         # 并行路径
+```
+
+**Step 5: 并行 vs 串行决策**
+
+```python
+# agent/tool_dispatch_helpers.py L103
+def _should_parallelize_tool_batch(tool_calls) -> bool:
+    if len(tool_calls) <= 1:
+        return False
+
+    # 绝不并行的工具
+    _NEVER_PARALLEL_TOOLS = frozenset({"clarify"})
+    if any(name in _NEVER_PARALLEL_TOOLS for name in tool_names):
+        return False
+
+    # 安全并行的只读工具
+    _PARALLEL_SAFE_TOOLS = frozenset({
+        "read_file", "search_files", "session_search",
+        "skill_view", "skills_list", "vision_analyze",
+        "web_extract", "web_search",
+        "ha_get_state", "ha_list_entities", "ha_list_services",
+    })
+
+    # 路径作用域工具：不同路径可并行
+    _PATH_SCOPED_TOOLS = frozenset({"read_file", "write_file", "patch"})
+    # → 检查路径是否重叠，不重叠才并行
+
+    # 其他工具（terminal、execute_code 等）→ 默认串行
+    # MCP 工具：检查 server 是否 opt-in parallel
+```
+
+**Step 6: 并行执行细节**
+
+```python
+# agent/tool_executor.py L561-604
+max_workers = min(len(runnable_calls), _MAX_TOOL_WORKERS)  # 最多 8 线程
+with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+    for i, tc, name, args in runnable_calls:
+        # 传播 ContextVars + 线程本地审批回调到工作线程
+        f = executor.submit(propagate_context_to_thread(_run_tool), i, tc, name, args, ...)
+        futures.append(f)
+
+    # 带心跳等待（5s 超时轮询），防网关不活跃监控杀进程
+    while True:
+        done, not_done = concurrent.futures.wait(futures, timeout=5.0)
+        if not not_done:
+            break
+        # 用户中断 → 取消未开始的 future，给已运行的 3s 优雅退出
+        if agent._interrupt_requested:
+            for f in not_done:
+                f.cancel()
+            concurrent.futures.wait(not_done, timeout=3.0)
+            break
+```
+
+### 12.3 handle_function_call 分发器
+
+```python
+# model_tools.py L863
+def handle_function_call(function_name, function_args, task_id, ...):
+    # 1. 类型强制转换（coerce_tool_args: "42" → 42）
+    function_args = coerce_tool_args(function_name, function_args)
+
+    # 2. Tool Search bridge 分发
+    if is_bridge_tool(function_name):  # tool_search / tool_describe / tool_call
+        return handle_bridge_dispatch(...)
+
+    # 3. 正常工具注册表分发
+    handler = get_tool_handler(function_name)
+    result = handler(**function_args)
+    return json.dumps(result)
+```
+
+### 12.4 工具结果追加
+
+工具执行完成后，结果按**原始顺序**追加到消息列表（无论并行还是串行执行）：
+
+```python
+for i in sorted(completed_indices):
+    messages.append({
+        "role": "tool",
+        "name": tool_name,
+        "tool_call_id": tc.id,
+        "content": result,
+    })
+```
+
+### 12.5 空响应处理
 
 ```
 响应内容为空
     → 重试（最多 _empty_content_retries 次）
-    → 仍为空 → 返回上一次有内容的响应
-```
-
-### 不完整响应
-
-```
-模型返回 finish_reason="length"
-    → length_continue_retries
-    → 追加 continuation prompt
-    → 继续请求
+    → 仍为空 → 尝试 thinking prefill（注入推理提示）
+    → 仍为空 → 返回上一次有内容的响应或 "I apologize..."
 ```
 
 ## 十三、后处理阶段
@@ -415,7 +753,16 @@ if compression_enabled and len(messages) > threshold:
 | 设计决策 | 原因 |
 |---|---|
 | 转发模式（Forwarder） | 将 5K+ 行逻辑拆分到独立模块 |
-| 系统提示词缓存 | 省钱：Anthropic prefix cache 命中 |
+| 系统提示词三层架构 | stable/context/volatile 分层，最大化 prefix cache 命中 |
+| 系统提示词四状态恢复 | missing/null/empty/present 区分，定位缓存失效原因 |
+| Prompt Caching `system_and_3` | 4 断点策略，降低 ~75% input token 成本 |
+| 时间戳仅日期精度 | 分钟精度会破坏 prefix cache |
+| StreamingThinkScrubber | 有状态过滤，防止跨 delta 的 reasoning 泄露 |
+| 双 Scrubber 重置 | 每轮清零，防残留状态污染 |
+| 工具并行执行（8 线程） | 只读工具 + 不重叠路径工具可安全并行 |
+| 工具名自动修复 | 模糊匹配纠正模型幻觉的工具名（最多 3 次） |
+| 工具 JSON 参数恢复 | 截断检测 + 注入恢复性 tool result |
+| delegate_task 并发限制 | `_cap_delegate_task_calls` 防止子 Agent 过多 |
 | Grace Call | 避免模型在中间状态被截断 |
 | 独立迭代预算 | 父子 Agent 解耦，子 Agent 不消耗父预算 |
 | Preflight 压缩 | 主动预防而非被动等待 429 |
@@ -426,6 +773,13 @@ if compression_enabled and len(messages) > threshold:
 
 - [ ] 能否用自己的话描述 Agent Loop 的完整流程？
 - [ ] 理解 Grace Call 的设计意图？
+- [ ] **系统提示词三层架构各包含什么？为什么这样分层？**
+- [ ] **`system_and_3` prompt caching 策略的 4 个断点放在哪里？**
+- [ ] **为什么时间戳用日期精度而非分钟精度？**
+- [ ] **StreamingThinkScrubber 解决了什么问题？状态机如何工作？**
+- [ ] **_fire_stream_delta 的双 Scrubber 管线顺序是什么？**
+- [ ] **工具执行管线的 6 个步骤分别是什么？**
+- [ ] **_should_parallelize_tool_batch 如何判断是否并行？三类工具是什么？**
 - [ ] 为什么系统提示词要缓存而不是每次重建？
 - [ ] IterationBudget 为什么需要线程安全？
 - [ ] 能解释 Preflight 压缩的触发条件和流程？
